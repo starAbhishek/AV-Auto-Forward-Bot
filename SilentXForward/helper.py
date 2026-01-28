@@ -51,7 +51,7 @@ BUTTONS = InlineKeyboardMarkup(
     [
         [
             InlineKeyboardButton("📢 Channel", url="https://t.me/AV_MOVIES_WORLD"),
-            InlineKeyboardButton("🥰 ཧᜰ꙰ꦿ➢𝐀𝐛𝔥𝕚ŞℍＥҜ༒", url="https://t.me/AV_King1")
+            InlineKeyboardButton("👨‍💻 ཧᜰ꙰ꦿ➢𝐀𝐛𝔥𝕚ŞℍＥҜ༒", url="https://t.me/AV_King1")
         ]
     ]
 )
