@@ -5,6 +5,14 @@ from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, RPCError
 from SilentXForward import database
 
+# ================= CONFIG =================
+BUFFER_DELAY = 2
+QUEUE_WORKERS = 3
+TARGET_CONCURRENCY = 3
+MSG_DELAY = 0.1
+TARGET_DELAY = 0.15
+# ==========================================
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -12,33 +20,24 @@ message_queue = asyncio.Queue()
 message_buffer = defaultdict(list)
 buffer_tasks = {}
 
-BUFFER_DELAY = 4
-
+# ================= FLOOD HANDLER =================
 async def handle_flood(func, **kwargs):
-    max_retries = 3
-    retry_count = 0
-    
-    while retry_count < max_retries:
+    retries = 3
+    for attempt in range(retries):
         try:
             return await func(**kwargs)
         except FloodWait as e:
-            logger.warning(f"FloodWait detected. Sleeping for {e.value} seconds.")
+            logger.warning(f"FloodWait: sleeping {e.value}s")
             await asyncio.sleep(e.value + 1)
         except RPCError as e:
             logger.error(f"RPCError: {e}")
-            retry_count += 1
-            if retry_count >= max_retries:
-                raise e
-            await asyncio.sleep(2 ** retry_count)
+            await asyncio.sleep(2 ** attempt)
         except Exception as e:
-            logger.error(f"Unexpected error: {e}")
-            retry_count += 1
-            if retry_count >= max_retries:
-                raise e
-            await asyncio.sleep(2 ** retry_count)
-    
-    raise Exception(f"Failed after {max_retries} retries")
+            logger.exception(f"Unexpected error in RPC call: {e}")
+            await asyncio.sleep(2 ** attempt)
+    raise Exception("Max retries exceeded")
 
+# ================= SINGLE FORWARD =================
 async def forward_single_message(client, message, chat_id):
     try:
         kwargs = {
@@ -46,137 +45,156 @@ async def forward_single_message(client, message, chat_id):
             "from_chat_id": message.chat.id,
             "message_id": message.id,
         }
-        
-        if message.caption:
+
+        # Defensive attribute access for caption / entities
+        if getattr(message, "caption", None):
             kwargs["caption"] = message.caption
-            if message.caption_entities:
+            if getattr(message, "caption_entities", None):
                 kwargs["caption_entities"] = message.caption_entities
-        
+
         await handle_flood(client.copy_message, **kwargs)
-        logger.info(f"Forwarded message {message.id} from {message.chat.id} to {chat_id}")
         return True
-    except Exception as e:
-        logger.error(f"Error forwarding message {message.id} to {chat_id}: {e}")
+    except Exception:
+        logger.exception(f"Forward failed {getattr(message, 'id', None)} -> {chat_id}")
         return False
 
+# ================= BUFFER FORWARD =================
 async def forward_buffered_messages(client, messages, chat_id):
-    try:
-        sorted_messages = sorted(messages, key=lambda m: m.id)
-        success_count = 0
-        
-        for msg in sorted_messages:
-            if await forward_single_message(client, msg, chat_id):
-                success_count += 1
-                await asyncio.sleep(0.3)
-        
-        logger.info(f"Forwarded {success_count}/{len(messages)} buffered messages to {chat_id}")
-        return success_count > 0
-        
-    except Exception as e:
-        logger.error(f"Error forwarding buffered messages to {chat_id}: {e}")
-        return False
-
-async def process_queue(client):
-    while True:
+    success = 0
+    for msg in sorted(messages, key=lambda m: m.id):
         try:
-            data = await message_queue.get()
-            if not data:
-                message_queue.task_done()
-                continue
-            
-            message_or_list, target_ids, forward_type = data
-            failed_targets = []
-            
-            for chat_id in target_ids:
-                try:
-                    if forward_type == "buffered":
-                        success = await forward_buffered_messages(client, message_or_list, chat_id)
-                    else:
-                        success = await forward_single_message(client, message_or_list, chat_id)
-                    
-                    if not success:
-                        failed_targets.append(chat_id)
-                    
-                    await asyncio.sleep(0.5)
-                    
-                except FloodWait as e:
-                    logger.warning(f"FloodWait for chat {chat_id}. Waiting {e.value}s")
-                    await asyncio.sleep(e.value + 1)
-                    failed_targets.append(chat_id)
-                except Exception as e:
-                    logger.error(f"Error forwarding to {chat_id}: {e}")
-                    failed_targets.append(chat_id)
-            
-            if failed_targets:
-                logger.info(f"Re-queuing for {len(failed_targets)} failed target(s)")
-                await message_queue.put((message_or_list, failed_targets, forward_type))
-            
-            message_queue.task_done()
-            
-        except Exception as e:
-            logger.error(f"Queue processing error: {e}")
-            message_queue.task_done()
-            await asyncio.sleep(1)
+            ok = await forward_single_message(client, msg, chat_id)
+            if ok:
+                success += 1
+        except Exception:
+            logger.exception(f"Error forwarding buffered msg {getattr(msg,'id',None)} -> {chat_id}")
+        await asyncio.sleep(MSG_DELAY)
+    logger.info(f"Buffered forwarded {success}/{len(messages)} -> {chat_id}")
+    return success > 0
 
+# ================= QUEUE WORKER =================
+async def process_queue(client):
+    sem = asyncio.Semaphore(TARGET_CONCURRENCY)
+
+    async def forward_target(chat_id, payload, ftype):
+        async with sem:
+            if ftype == "buffered":
+                return await forward_buffered_messages(client, payload, chat_id)
+            return await forward_single_message(client, payload, chat_id)
+
+    while True:
+        payload, targets, ftype = await message_queue.get()
+        failed = []
+
+        tasks = [forward_target(tid, payload, ftype) for tid in targets]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for tid, res in zip(targets, results):
+            if res is not True:
+                failed.append(tid)
+
+        if failed:
+            logger.info(f"Retrying {len(failed)} targets")
+            await message_queue.put((payload, failed, ftype))
+
+        message_queue.task_done()
+        await asyncio.sleep(TARGET_DELAY)
+
+# ================= START PROCESSORS =================
 async def start_processor(client):
-    task = asyncio.create_task(process_queue(client))
-    logger.info("Message processor started")
-    return {'main_processor': task}
+    """
+    Starts queue workers and returns a dict of tasks.
+    Returning a dict keeps compatibility with existing bot.py that expects .values().
+    """
+    tasks = {}
+    for i in range(QUEUE_WORKERS):
+        t = asyncio.create_task(process_queue(client))
+        tasks[f"worker_{i}"] = t
+    logger.info(f"{QUEUE_WORKERS} queue workers started")
+    return tasks
 
-async def process_buffered_messages(source_chat_id):
-    await asyncio.sleep(BUFFER_DELAY)
-    
-    buffer_key = source_chat_id
-    if buffer_key not in message_buffer:
+# ================= NEW: start_forwarder / stop_forwarder (Pyrogram-version safe) =================
+async def start_forwarder(client):
+    """
+    Call this after client.start() to ensure worker tasks are created and attached to client.
+    Example in bot.py:
+        await start_forwarder(app)
+    """
+    if getattr(client, "_queue_tasks", None):
+        # already started
         return
-    
-    messages = message_buffer[buffer_key]
-    if not messages:
-        del message_buffer[buffer_key]
-        if buffer_key in buffer_tasks:
-            del buffer_tasks[buffer_key]
-        return
-    
+    client._queue_tasks = await start_processor(client)
+
+async def stop_forwarder(client, timeout: float = 5.0):
+    """
+    Cancel worker tasks stored on client._queue_tasks and wait for the queue to drain.
+    Example in bot.py:
+        await stop_forwarder(app)
+    """
+    tasks = getattr(client, "_queue_tasks", {}) or {}
+    for t in tasks.values():
+        t.cancel()
     try:
-        mappings = await database.get_all_targets_for_source(source_chat_id)
-        if not mappings:
-            del message_buffer[buffer_key]
-            if buffer_key in buffer_tasks:
-                del buffer_tasks[buffer_key]
-            return
-        
-        message_count = len(messages)
-        for mapping in mappings:
-            target_ids = mapping.get('target_ids', [])
-            if target_ids:
-                await message_queue.put((messages.copy(), target_ids, "buffered"))
-                logger.info(f"Queued buffered group ({message_count} files) from {source_chat_id} for {len(target_ids)} target(s)")
-        
-    except Exception as e:
-        logger.error(f"Error processing buffered messages: {e}")
-    finally:
-        if buffer_key in message_buffer:
-            del message_buffer[buffer_key]
-        if buffer_key in buffer_tasks:
-            del buffer_tasks[buffer_key]
+        await asyncio.wait_for(message_queue.join(), timeout=timeout)
+    except Exception:
+        logger.info("Shutdown: queue join timeout or interrupted")
+    client._queue_tasks = {}
 
+# ================= BUFFER HANDLER =================
+async def process_buffered_messages(source_chat_id):
+    """
+    Wait BUFFER_DELAY, then atomically take buffered messages and queue them.
+    Handles cancellation (e.g., when a new message arrives and previous timer is cancelled).
+    """
+    try:
+        await asyncio.sleep(BUFFER_DELAY)
+        # Atomically take and remove the buffer for this source
+        messages = message_buffer.pop(source_chat_id, None)
+        if not messages:
+            return
+
+        try:
+            mappings = await database.get_all_targets_for_source(source_chat_id)
+            for mapping in mappings:
+                targets = mapping.get("target_ids", [])
+                if targets:
+                    await message_queue.put((messages.copy(), targets, "buffered"))
+                    logger.info(
+                        f"Queued {len(messages)} msgs from {source_chat_id} -> {len(targets)} targets"
+                    )
+        except Exception:
+            logger.exception("Buffer process error while queuing")
+    except asyncio.CancelledError:
+        # Normal: task was cancelled because a new message arrived and we rescheduled
+        logger.debug(f"Buffer task for {source_chat_id} cancelled")
+        raise
+    except Exception:
+        logger.exception("Unexpected error in buffer processor")
+    finally:
+        # Ensure we remove the task entry if present
+        buffer_tasks.pop(source_chat_id, None)
+
+# ================= MESSAGE LISTENER =================
 @Client.on_message(
-    filters.channel & 
-    (filters.video | filters.document | filters.photo | filters.audio | filters.sticker | filters.animation | filters.text)
+    filters.channel &
+    (filters.video | filters.document | filters.photo |
+     filters.audio | filters.sticker | filters.animation | filters.text)
 )
 async def forward_content(client, message):
     try:
-        source_chat_id = message.chat.id
-        
-        buffer_key = source_chat_id
-        message_buffer[buffer_key].append(message)
-        
-        if buffer_key in buffer_tasks:
-            buffer_tasks[buffer_key].cancel()
-        
-        buffer_tasks[buffer_key] = asyncio.create_task(
-            process_buffered_messages(source_chat_id)
-        )
-        
-    except Exception as e:
-        logger.error(f"Error in forward_content handler: {e}", exc_info=True)
+        cid = message.chat.id
+        # Append to buffer
+        message_buffer[cid].append(message)
+
+        # If previous buffer task exists, cancel it and schedule a new one
+        old = buffer_tasks.get(cid)
+        if old and not old.done():
+            try:
+                old.cancel()
+            except Exception:
+                logger.debug("Old buffer task cancel raised", exc_info=True)
+
+        # Schedule new buffer processing task
+        buffer_tasks[cid] = asyncio.create_task(process_buffered_messages(cid))
+    except Exception:
+        logger.exception("Handler error")
